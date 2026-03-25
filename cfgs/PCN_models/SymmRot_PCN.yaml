@@ -1,3 +1,7 @@
+total_bs: 16
+max_epoch: 50
+step_per_update: 1  # ? 新增在这里，和上面两个并列
+
 optimizer : {
   type: AdamW,
   kwargs: {
@@ -9,7 +13,7 @@ scheduler: {
   type: WarmUpCosLR,
   kwargs: {
   warmup_epoch: 20,
-  max_epoch: 420,
+  max_epoch: 50,
   lr_max: 0.0002,
   lr_min: 0.00001, 
 }}
@@ -18,20 +22,15 @@ dataset : {
   train : { _base_: ./cfgs/dataset_configs/PCN.yaml, 
             others: {subset: 'train'}},
   val : { _base_: ./cfgs/dataset_configs/PCN.yaml, 
-            others: {subset: 'test'}},
+          others: {subset: 'test'}},
   test : { _base_: ./cfgs/dataset_configs/PCN.yaml, 
-            others: {subset: 'test'}}}
+           others: {subset: 'test'}}}
 
 model : {
-  NAME: SymmCompletion,  # 如果你在 models/ 下注册了新名字（例如 SymRotNet），请改成新名字
+  NAME: SymmCompletion,
   up_factors: "2, 8", 
   include_input: False, 
   coarse_up_factor: 2
 }
-
-# --- 核心修改区 ---
-total_bs : 16        # 必须大幅降低！原版是 48，VN 架构特征维度激增 (Cx3)，32G 显存通常只能吃下 16 到 24。如果 16 依然 OOM，请降为 8。
-step_per_update : 1  # 如果 total_bs 降为 8，可以将此项设为 2 (梯度累加，等效 bs=16)
-max_epoch : 420      # 保持与 scheduler 的 max_epoch 一致
 
 consider_metric: CDL1

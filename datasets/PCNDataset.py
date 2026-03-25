@@ -92,8 +92,12 @@ class PCN(data.Dataset):
 
         for ri in ['partial', 'gt']:
             file_path = sample['%s_path' % ri]
-            if type(file_path) == list:
-                file_path = file_path[rand_idx]
+            # --- 修改核心开始 ---
+            if isinstance(file_path, list):
+                # 确保索引不越界，如果列表只有一个元素（如验证集），则取第0个
+                real_idx = rand_idx if len(file_path) > rand_idx else 0
+                file_path = file_path[real_idx]
+            # --- 修改核心结束 ---
             data[ri] = IO.get(file_path).astype(np.float32)
 
         assert data['gt'].shape[0] == self.npoints

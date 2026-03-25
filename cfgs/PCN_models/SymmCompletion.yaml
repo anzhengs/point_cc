@@ -28,8 +28,8 @@ model : {
   coarse_up_factor: 2}
 
 
-total_bs : 48
-step_per_update : 1
-max_epoch : 420
+total_bs: 8
+step_per_update: 2
+max_epoch: 50
 
 consider_metric: CDL1
