@@ -238,7 +238,8 @@ class SymmCompletion(nn.Module):
         super().__init__()
         self.up_factors = [int(i) for i in config.up_factors.split(',')]
         # 替换为VN版本的LSTNet
-        self.lstnet = VN_LSTNet(out_dim=512, K=8)
+        #self.lstnet = VN_LSTNet(out_dim=512, K=8)
+        self.lstnet = LSTNet(out_dim=512, K=8)
         self.local_encoder = local_encoder(out_channel=128)
         self.sgformer_1 = SGFormer(gf_dim=512, up_factor=self.up_factors[0])
         self.sgformer_2 = SGFormer(gf_dim=512, up_factor=self.up_factors[1])
