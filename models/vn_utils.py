@@ -24,7 +24,8 @@ class VNBatchNorm(nn.Module):
         self.bn = nn.BatchNorm1d(num_features)
 
     def forward(self, x):
-        norm = torch.norm(x, p=2, dim=-1) + 1e-8
+        norm_sq = (x ** 2).sum(dim=-1)
+        norm = torch.sqrt(norm_sq + 1e-8)
         norm_bn = self.bn(norm)
         factor = norm_bn / norm
         return x * factor.unsqueeze(-1)
@@ -37,7 +38,13 @@ class VNLeakyReLU(nn.Module):
 
     def forward(self, x):
         v = self.v_gen(x)
+
+        v_norm_sq = (v ** 2).sum(dim=-1, keepdim=True)
+        v_norm = torch.sqrt(v_norm_sq + 1e-8)
+        v = v / v_norm
+
         dot = (x * v).sum(dim=-1, keepdim=True)
+        
         proj = dot * v
         res = x - proj
         mask = (dot >= 0).float()
@@ -50,7 +57,7 @@ class VNMaxPool(nn.Module):
 
     def forward(self, x):
         # 计算 L2 范数，保持维度
-        norm = torch.norm(x, p=2, dim=-1, keepdim=True)
+        norm = torch.norm(x, p=2, dim=-1, keepdim=True) + 1e-8
         # 在指定维度（通常是邻居维度 S，dim=-2）求最大值的索引
         idx = torch.argmax(norm, dim=self.dim, keepdim=True)
         

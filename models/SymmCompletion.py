@@ -225,7 +225,8 @@ class VN_LSTNet(nn.Module):
         coarse = torch.cat([symmetry_points, keypoints], dim=-1)  # (B, 3, 1024)
 
         # Step9: 提取旋转不变标量特征（给后续SGFormer使用，无需修改后端）
-        keyfeatures_scalar = torch.norm(keyfeatures_vec, p=2, dim=-1)  # (B, 128, 512)
+        # 根号内加 eps，彻底安全，等价范数，无任何结构改动
+        keyfeatures_scalar = torch.sqrt((keyfeatures_vec ** 2).sum(dim=-1) + 1e-8)  # (B, 128, 512)
 
         return coarse, symmetry_points, keyfeatures_scalar
 
@@ -238,8 +239,7 @@ class SymmCompletion(nn.Module):
         super().__init__()
         self.up_factors = [int(i) for i in config.up_factors.split(',')]
         # 替换为VN版本的LSTNet
-        #self.lstnet = VN_LSTNet(out_dim=512, K=8)
-        self.lstnet = LSTNet(out_dim=512, K=8)
+        self.lstnet = VN_LSTNet(out_dim=512, K=8)
         self.local_encoder = local_encoder(out_channel=128)
         self.sgformer_1 = SGFormer(gf_dim=512, up_factor=self.up_factors[0])
         self.sgformer_2 = SGFormer(gf_dim=512, up_factor=self.up_factors[1])
