@@ -31,5 +31,6 @@ model : {
 total_bs: 16
 step_per_update: 1
 max_epoch: 300   #420
+val_freq: 20   #设置验证频率
 
 consider_metric: CDL1
