@@ -15,28 +15,33 @@ from .vn_utils import VN_PointNet_SA_Module_KNN, VNLinear, VNMaxPool
 class VNFrameEstimator(nn.Module):
     def __init__(self):
         super().__init__()
+        # 第一级：从原始坐标提取逐点等变特征
         self.vn_sa1 = VN_PointNet_SA_Module_KNN(
             npoint=256, nsample=32, in_channel=1,
             mlp=[64, 128], group_all=False, if_bn=True, if_idx=False
         )
+        # 第二级：在第一级特征基础上进一步抽象
+        # in_channel = 1(相对坐标) + 128(feat1通道) = 129
         self.vn_sa2 = VN_PointNet_SA_Module_KNN(
             npoint=128, nsample=16, in_channel=129,
-            mlp=[64, 256], group_all=False, if_bn=True, if_idx=False
+            mlp=[128, 256], group_all=False, if_bn=True, if_idx=False
         )
+        # 全局等变池化
         self.vn_global_pool = VNMaxPool(dim=-2)
-        self.vn_predict = VNLinear(256, 2)
+        # SVD 模式：预测 3 个等变向量 → 组成 3×3 矩阵 → SVD 正交化
+        self.vn_predict = VNLinear(256, 3)
 
-        # 行列式修正统计
-        self._det_correction_count = 0
+        # 行列式监控
+        self._neg_det_count = 0
         self._total_count = 0
 
     def forward(self, x):
         """
         x: (B, 3, N) 输入残缺点云
-        返回: 
-            R_align (B, 3, 3) 修正后的旋转矩阵（det=+1保证合法）
-            v1 (B, 3) 预测的第一个基底向量
-            v2 (B, 3) 预测的第二个基底向量
+        返回:
+            R_align (B, 3, 3) SVD正交化后的旋转矩阵，保证 det = +1
+            v1 (B, 3) 原始预测的第1行向量（供正交损失使用）
+            v2 (B, 3) 原始预测的第2行向量（供正交损失使用）
         """
         b, _, n = x.shape
         x_points = x.transpose(1, 2).unsqueeze(1).contiguous()
@@ -47,61 +52,83 @@ class VNFrameEstimator(nn.Module):
         else:
             xyz1, feat1 = self.vn_sa1(x, x_points)
 
-        # ========== 第二级编码（传入feat1） ==========
+        # ========== 第二级编码（传入 feat1） ==========
         xyz1_t = xyz1.transpose(1, 2).unsqueeze(1).contiguous()
         if self.training:
             _, v_feat = checkpoint(self._sa2_wrap, xyz1, xyz1_t, feat1, use_reentrant=False)
         else:
             _, v_feat = self.vn_sa2(xyz1, xyz1_t, prev_feat=feat1)
 
-        # ========== 全局池化 + 预测基底 ==========
+        # ========== 全局池化 + 预测 3×3 矩阵 ==========
         v_feat = self.vn_global_pool(v_feat).squeeze(-2)  # (B, 256, 3)
         v_feat = v_feat.unsqueeze(2)                        # (B, 256, 1, 3)
-        basis = self.vn_predict(v_feat).squeeze(2)          # (B, 2, 3)
+        M = self.vn_predict(v_feat).squeeze(2)              # (B, 3, 3)
 
-        v1 = basis[:, 0, :]  # (B, 3)
-        v2 = basis[:, 1, :]  # (B, 3)
+        # ========== SVD Procrustes 正交化 ==========
+        R_align = self._procrustes(M)
 
-        # ========== Gram-Schmidt 正交化 ==========
-        u1 = F.normalize(v1, p=2, dim=-1, eps=1e-8)
-        u2_raw = v2 - (v2 * u1).sum(dim=-1, keepdim=True) * u1
-        u2_norm = torch.norm(u2_raw, p=2, dim=-1, keepdim=True).clamp(min=1e-6)
-        u2 = u2_raw / u2_norm
-        u3 = torch.cross(u1, u2, dim=-1)
+        # ========== 保存中间变量供损失函数使用 ==========
+        v1 = M[:, 0, :]  # (B, 3)
+        v2 = M[:, 1, :]  # (B, 3)
+        v3 = M[:, 2, :]  # (B, 3)
+        self.v3 = v3     #  新增
+        self.det_pre = torch.det(M)  # (B,) 原始矩阵的行列式，用于监控和损失
 
-        R_align_pre = torch.stack([u1, u2, u3], dim=-1)  # (B, 3, 3)
-        det = torch.det(R_align_pre)                      # (B,)
-
-        # 统计修正频率
-        self._det_correction_count += (det < 0).sum().item()
-        self._total_count += det.shape[0]
-
-        # det < 0 时翻转第三列，保证输出始终是合法旋转矩阵
-        sign = torch.where(det >= 0, torch.ones_like(det), -torch.ones_like(det))
-        sign = sign.unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
-        r_col3 = R_align_pre[:, :, 2:3] * sign
-        R_align = torch.cat([
-            R_align_pre[:, :, 0:1],
-            R_align_pre[:, :, 1:2],
-            r_col3
-        ], dim=-1)  # (B, 3, 3)
-
-        # ========== 保存修正前的信息，供 get_loss 使用 ==========
-        self.R_align_pre = R_align_pre
-        self.det_pre = det
+        # 统计负行列式比例
+        if self.training:
+            self._neg_det_count += (self.det_pre < 0).sum().item()
+            self._total_count += b
 
         return R_align, v1, v2
 
     def _sa2_wrap(self, xyz1, xyz1_t, feat1):
-        """包装函数，供 checkpoint 使用（不接受关键字参数）"""
+        """包装函数，供 gradient checkpoint 使用（不支持关键字参数）"""
         return self.vn_sa2(xyz1, xyz1_t, prev_feat=feat1)
 
-    def get_correction_rate(self):
-        """返回修正率，用于监控训练状态，每次调用后重置计数器"""
+    @staticmethod
+    def _procrustes(M):
+        """
+        SVD 正交化：Procrustes 问题的闭式最优解
+
+        给定任意 3×3 矩阵 M，求解：
+            R* = argmin ||M - R||_F^2   s.t. R ∈ SO(3)
+
+        解为 R = U @ diag(1, 1, det(UVh)) @ Vh
+        其中 M = U S Vh 是 SVD 分解
+
+        相比 Gram-Schmidt 的优势：
+            1) 梯度处处连续（3×3 矩阵 SVD 的梯度性质优良）
+            2) 不存在 v1≈v2 时的数值爆炸
+            3) 无需 normalize 的 eps 防护
+            4) 修正操作有梯度信号（Vh_mod 的 clone+乘法可反传）
+        """
+        U, S, Vh = torch.linalg.svd(M, full_matrices=False)
+
+        # 计算未修正旋转的行列式
+        det_uv = torch.det(U @ Vh)  # (B,)
+
+        # 构造修正符号：det < 0 时翻转 Vh 最后一行
+        sign = torch.where(
+            det_uv >= 0,
+            torch.ones_like(det_uv),
+            -torch.ones_like(det_uv)
+        )
+
+        # 翻转 Vh 最后一行（等价于右乘 diag(1, 1, sign)）
+        Vh_mod = Vh.clone()
+        Vh_mod[:, -1, :] = Vh_mod[:, -1, :] * sign.unsqueeze(-1)
+
+        # 构造最终旋转矩阵
+        R = U @ Vh_mod
+
+        return R
+
+    def get_neg_det_rate(self):
+        """返回训练中 M 的负行列式比例，用于监控，调用后重置"""
         if self._total_count == 0:
             return 0.0
-        rate = self._det_correction_count / self._total_count
-        self._det_correction_count = 0
+        rate = self._neg_det_count / self._total_count
+        self._neg_det_count = 0
         self._total_count = 0
         return rate
 
@@ -314,23 +341,32 @@ class SymmCompletion(nn.Module):
             loss_list.append(loss)
             loss_total += loss
 
-        v1 = self.v1  # (B, 3)
-        v2 = self.v2  # (B, 3)
+        v1 = self.v1  # (B, 3) — M 的第1行
+        v2 = self.v2  # (B, 3) — M 的第2行
+        v3 = self.v3  # (B, 3) — M 的第3行
 
-        # 正交惩罚
+        # 正交惩罚：所有行向量对之间互相垂直
         v1_norm = F.normalize(v1, p=2, dim=-1)
         v2_norm = F.normalize(v2, p=2, dim=-1)
-        loss_ortho = torch.mean((torch.sum(v1_norm * v2_norm, dim=-1)) ** 2)
-        
-        # 范数正则化
+        v3_norm = F.normalize(v3, p=2, dim=-1)
+        ortho_12 = (torch.sum(v1_norm * v2_norm, dim=-1)) ** 2
+        ortho_13 = (torch.sum(v1_norm * v3_norm, dim=-1)) ** 2
+        ortho_23 = (torch.sum(v2_norm * v3_norm, dim=-1)) ** 2
+        loss_ortho = torch.mean(ortho_12 + ortho_13 + ortho_23)
+    
+        # 范数正则化：三个行向量都不能退化
         loss_norm = torch.mean(
-            torch.exp(-torch.norm(v1, p=2, dim=-1)) + 
-            torch.exp(-torch.norm(v2, p=2, dim=-1))
+            torch.exp(-torch.norm(v1, p=2, dim=-1)) +
+            torch.exp(-torch.norm(v2, p=2, dim=-1)) +
+            torch.exp(-torch.norm(v3, p=2, dim=-1))
         )
 
         loss_det = torch.mean(torch.relu(-self.det_pre) ** 2)
 
-        total_loss = loss_total + self.ortho_weight * loss_ortho + self.norm_weight * loss_norm + self.det_weight * loss_det
+        total_loss = (loss_total
+                      + self.ortho_weight * loss_ortho
+                      + self.norm_weight * loss_norm
+                      + self.det_weight * loss_det)
 
         return total_loss, loss_list[0], loss_list[-1], loss_ortho, loss_norm
 
@@ -338,11 +374,12 @@ class SymmCompletion(nn.Module):
         pc_t = point_cloud.transpose(1, 2).contiguous()
         R_align, v1, v2 = self.vn_frame_estimator(pc_t)
 
+        # 保存供 get_loss 使用
         self.R_align = R_align
-        self.R_align_pre = self.vn_frame_estimator.R_align_pre
         self.det_pre = self.vn_frame_estimator.det_pre
         self.v1 = v1
         self.v2 = v2
+        self.v3 = self.vn_frame_estimator.v3
 
         pc_canonical = torch.bmm(point_cloud, R_align)
 
