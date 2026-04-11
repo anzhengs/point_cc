@@ -73,7 +73,6 @@ class VNMaxPool(nn.Module):
 # ==============================================================================
 
 class VN_PointNet_SA_Module_KNN(nn.Module):
-    # 增加 group_all=False 参数以接收外部传参
     def __init__(self, npoint, nsample, in_channel, mlp, group_all=False, if_bn=True, if_idx=True):
         super().__init__()
         self.npoint = npoint
@@ -82,7 +81,7 @@ class VN_PointNet_SA_Module_KNN(nn.Module):
         self.group_all = group_all
 
         layers = []
-        cin = in_channel
+        cin = in_channel  # ✅ 现在 in_channel 真正生效
         for cout in mlp:
             layers.append(VNLinear(cin, cout))
             if if_bn:
@@ -92,11 +91,15 @@ class VN_PointNet_SA_Module_KNN(nn.Module):
         self.mlp = nn.Sequential(*layers)
         self.pool = VNMaxPool(dim=-2)
 
-    def forward(self, xyz, points, fixed_idx=None):
+    def forward(self, xyz, points, prev_feat=None, fixed_idx=None):
+        """
+        xyz: (B, 3, N) 坐标
+        points: (B, 1, N, 1) 或 None，仅用于兼容旧接口
+        prev_feat: (B, C_prev, N, 3) 上一级的VN特征，None表示没有
+        """
         B, _, N = xyz.shape
         xyz_t = xyz.permute(0, 2, 1).contiguous()
 
-        # 支持固定索引（等变验证专用）
         if fixed_idx is None:
             fps_idx = furthest_point_sample(xyz_t, self.npoint)
         else:
@@ -105,15 +108,32 @@ class VN_PointNet_SA_Module_KNN(nn.Module):
         new_xyz = gather_operation(xyz, fps_idx)
         new_xyz_t = new_xyz.permute(0, 2, 1).contiguous()
 
-        # KNN 与相对坐标（平移不变）
+        # KNN 与相对坐标
         idx = query_knn_point(self.nsample, xyz_t, new_xyz_t)
         grouped_xyz = grouping_operation(xyz, idx.int())
-        grouped_xyz -= new_xyz.unsqueeze(-1)
-        grouped_xyz = grouped_xyz.permute(0, 2, 3, 1).contiguous()  # 形状变为 (B, G, S, 3)
-        # 特征构造
-        v_feat = grouped_xyz.unsqueeze(1)  # (B,1,G,S,3)
+        grouped_xyz -= new_xyz.unsqueeze(-1)  # (B, 3, G*S)
+        grouped_xyz = grouped_xyz.permute(0, 2, 3, 1).contiguous()  # (B, G, S, 3)
 
-        # ====================== 修复陷阱 B ======================
+        # 核心：拼接上一级特征
+        if prev_feat is not None:
+            C_prev = prev_feat.shape[1]  # 128
+        
+            # Step 1: permute + reshape，保证 c' = c*3 + d 的正确映射
+            prev_feat_flat = prev_feat.permute(0, 1, 3, 2).contiguous().reshape(B, C_prev * 3, N)
+        
+            # Step 2: grouping_operation 对展平特征做邻域聚合
+            grouped_prev_flat = grouping_operation(prev_feat_flat, idx.int())  # (B, C_prev*3, G*S)
+        
+            # Step 3: 逆 reshape，恢复 VN 特征的 3D 向量结构
+            grouped_prev = grouped_prev_flat.reshape(B, C_prev, 3, self.npoint * self.nsample)
+            grouped_prev = grouped_prev.permute(0, 1, 3, 2).contiguous()  # (B, C_prev, G*S, 3)
+            grouped_prev = grouped_prev.reshape(B, C_prev, self.npoint, self.nsample, 3)
+        
+            # Step 4: 拼接相对坐标(1通道) + 上一级特征(C_prev通道)
+            v_feat = torch.cat([grouped_xyz.unsqueeze(1), grouped_prev], dim=1)  # (B, 1+C_prev, G, S, 3)
+        else:
+            v_feat = grouped_xyz.unsqueeze(1)  # (B, 1, G, S, 3)
+
         B, C, G, S, D = v_feat.shape
         v_feat = v_feat.reshape(B, C, G * S, 3)
         v_feat = self.mlp(v_feat)

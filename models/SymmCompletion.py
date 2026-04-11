@@ -2,13 +2,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from extensions.chamfer_dist import ChamferDistanceL1
 from .model_utils import MLP_CONV, Transformer, PointNet_SA_Module_KNN
 from .build import MODELS
-
-# ======================================
-# 导入 LEFC 前端所需的 VN 算子
-# ======================================
 from .vn_utils import VN_PointNet_SA_Module_KNN, VNLinear, VNMaxPool
 
 # ==============================================================================
@@ -18,51 +15,95 @@ from .vn_utils import VN_PointNet_SA_Module_KNN, VNLinear, VNMaxPool
 class VNFrameEstimator(nn.Module):
     def __init__(self):
         super().__init__()
-        # 两层SA + 更宽的通道
         self.vn_sa1 = VN_PointNet_SA_Module_KNN(
-            npoint=512, nsample=32, in_channel=1,
+            npoint=256, nsample=32, in_channel=1,
             mlp=[64, 128], group_all=False, if_bn=True, if_idx=False
         )
         self.vn_sa2 = VN_PointNet_SA_Module_KNN(
-            npoint=256, nsample=32, in_channel=128,
-            mlp=[128, 256], group_all=False, if_bn=True, if_idx=False
+            npoint=128, nsample=16, in_channel=129,
+            mlp=[64, 256], group_all=False, if_bn=True, if_idx=False
         )
         self.vn_global_pool = VNMaxPool(dim=-2)
         self.vn_predict = VNLinear(256, 2)
 
+        # 行列式修正统计
+        self._det_correction_count = 0
+        self._total_count = 0
+
     def forward(self, x):
+        """
+        x: (B, 3, N) 输入残缺点云
+        返回: 
+            R_align (B, 3, 3) 修正后的旋转矩阵（det=+1保证合法）
+            v1 (B, 3) 预测的第一个基底向量
+            v2 (B, 3) 预测的第二个基底向量
+        """
         b, _, n = x.shape
         x_points = x.transpose(1, 2).unsqueeze(1).contiguous()
 
-        # 两级编码
-        xyz1, feat1 = self.vn_sa1(x, x_points)
+        # ========== 第一级编码 ==========
+        if self.training:
+            xyz1, feat1 = checkpoint(self.vn_sa1, x, x_points, use_reentrant=False)
+        else:
+            xyz1, feat1 = self.vn_sa1(x, x_points)
+
+        # ========== 第二级编码（传入feat1） ==========
         xyz1_t = xyz1.transpose(1, 2).unsqueeze(1).contiguous()
-        _, v_feat = self.vn_sa2(xyz1, xyz1_t)  # 需要修改VN SA以接受特征
+        if self.training:
+            _, v_feat = checkpoint(self._sa2_wrap, xyz1, xyz1_t, feat1, use_reentrant=False)
+        else:
+            _, v_feat = self.vn_sa2(xyz1, xyz1_t, prev_feat=feat1)
 
+        # ========== 全局池化 + 预测基底 ==========
         v_feat = self.vn_global_pool(v_feat).squeeze(-2)  # (B, 256, 3)
-        v_feat = v_feat.unsqueeze(2)  # (B, 256, 1, 3)
-        basis = self.vn_predict(v_feat).squeeze(2)  # (B, 2, 3)
+        v_feat = v_feat.unsqueeze(2)                        # (B, 256, 1, 3)
+        basis = self.vn_predict(v_feat).squeeze(2)          # (B, 2, 3)
 
-        v1 = basis[:, 0, :]
-        v2 = basis[:, 1, :]
+        v1 = basis[:, 0, :]  # (B, 3)
+        v2 = basis[:, 1, :]  # (B, 3)
 
-        # Gram-Schmidt + det修正
+        # ========== Gram-Schmidt 正交化 ==========
         u1 = F.normalize(v1, p=2, dim=-1, eps=1e-8)
         u2_raw = v2 - (v2 * u1).sum(dim=-1, keepdim=True) * u1
         u2_norm = torch.norm(u2_raw, p=2, dim=-1, keepdim=True).clamp(min=1e-6)
         u2 = u2_raw / u2_norm
         u3 = torch.cross(u1, u2, dim=-1)
 
-        R_align = torch.stack([u1, u2, u3], dim=-1)  # (B, 3, 3)
-        det = torch.det(R_align)
-        sign = torch.sign(det).unsqueeze(-1).unsqueeze(-1)
-        r_col1 = R_align[:, :, 0:1]  # 保留前两列
-        r_col2 = R_align[:, :, 1:2]
-        r_col3 = R_align[:, :, 2:3] * sign  # 第三列乘符号（非原地）
-        R_align = torch.cat([r_col1, r_col2, r_col3], dim=-1)  # 重新拼接
-        # 只翻转第三列
+        R_align_pre = torch.stack([u1, u2, u3], dim=-1)  # (B, 3, 3)
+        det = torch.det(R_align_pre)                      # (B,)
+
+        # 统计修正频率
+        self._det_correction_count += (det < 0).sum().item()
+        self._total_count += det.shape[0]
+
+        # det < 0 时翻转第三列，保证输出始终是合法旋转矩阵
+        sign = torch.where(det >= 0, torch.ones_like(det), -torch.ones_like(det))
+        sign = sign.unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
+        r_col3 = R_align_pre[:, :, 2:3] * sign
+        R_align = torch.cat([
+            R_align_pre[:, :, 0:1],
+            R_align_pre[:, :, 1:2],
+            r_col3
+        ], dim=-1)  # (B, 3, 3)
+
+        # ========== 保存修正前的信息，供 get_loss 使用 ==========
+        self.R_align_pre = R_align_pre
+        self.det_pre = det
 
         return R_align, v1, v2
+
+    def _sa2_wrap(self, xyz1, xyz1_t, feat1):
+        """包装函数，供 checkpoint 使用（不接受关键字参数）"""
+        return self.vn_sa2(xyz1, xyz1_t, prev_feat=feat1)
+
+    def get_correction_rate(self):
+        """返回修正率，用于监控训练状态，每次调用后重置计数器"""
+        if self._total_count == 0:
+            return 0.0
+        rate = self._det_correction_count / self._total_count
+        self._det_correction_count = 0
+        self._total_count = 0
+        return rate
 
 # ==============================================================================
 # 原汁原味的 Baseline 类定义 (100% 保持原版不变，保证最高生成精度)
@@ -261,17 +302,11 @@ class SymmCompletion(nn.Module):
         self.include_input = config.include_input
         self.loss_func = ChamferDistanceL1()
         
-        # 正交损失权重
         self.ortho_weight = getattr(config, 'ortho_weight', 0.1)
-        # 范数正则化权重
         self.norm_weight = getattr(config, 'norm_weight', 0.01)
+        self.det_weight = getattr(config, 'det_weight', 0.1)
 
     def get_loss(self, rets, gt):
-        """
-        rets: list of predicted point clouds
-        gt: ground truth point cloud
-        v1, v2: stored in self during forward
-        """
         loss_list = []
         loss_total = 0
         for pcd in rets:
@@ -279,38 +314,38 @@ class SymmCompletion(nn.Module):
             loss_list.append(loss)
             loss_total += loss
 
-        # 正交惩罚：鼓励 v1 ⊥ v2（作为软约束辅助Gram-Schmidt）
         v1 = self.v1  # (B, 3)
         v2 = self.v2  # (B, 3)
+
+        # 正交惩罚
         v1_norm = F.normalize(v1, p=2, dim=-1)
         v2_norm = F.normalize(v2, p=2, dim=-1)
         loss_ortho = torch.mean((torch.sum(v1_norm * v2_norm, dim=-1)) ** 2)
         
-        # 范数正则化：防止 v1, v2 退化为零向量
-        # 指数形式，自然有界
+        # 范数正则化
         loss_norm = torch.mean(
             torch.exp(-torch.norm(v1, p=2, dim=-1)) + 
             torch.exp(-torch.norm(v2, p=2, dim=-1))
         )
 
+        loss_det = torch.mean(torch.relu(-self.det_pre) ** 2)
 
-        #  修正：将正交损失和范数正则加入总损失
-        total_loss = loss_total + self.ortho_weight * loss_ortho + self.norm_weight * loss_norm
+        total_loss = loss_total + self.ortho_weight * loss_ortho + self.norm_weight * loss_norm + self.det_weight * loss_det
 
         return total_loss, loss_list[0], loss_list[-1], loss_ortho, loss_norm
 
     def forward(self, point_cloud):
-        """
-        point_cloud: (B, N, 3)
-        """
-        # Phase 1: 规范化对齐
-        pc_t = point_cloud.transpose(1, 2).contiguous()  # (B, 3, N)
-        R_align, v1, v2 = self.vn_frame_estimator(pc_t)  # (B, 3, 3)
+        pc_t = point_cloud.transpose(1, 2).contiguous()
+        R_align, v1, v2 = self.vn_frame_estimator(pc_t)
 
-        # 将输入点云旋转到规范空间
-        pc_canonical = torch.bmm(point_cloud, R_align)  # (B, N, 3) × (B, 3, 3)
+        self.R_align = R_align
+        self.R_align_pre = self.vn_frame_estimator.R_align_pre
+        self.det_pre = self.vn_frame_estimator.det_pre
+        self.v1 = v1
+        self.v2 = v2
 
-        # Phase 2: 在规范空间中处理
+        pc_canonical = torch.bmm(point_cloud, R_align)
+
         coarse, symmetry_points, keyfeatures = self.lstnet(pc_canonical.transpose(2, 1).contiguous())
         feat_symmetry = self.local_encoder(symmetry_points)
         feat_partial = keyfeatures
@@ -322,16 +357,11 @@ class SymmCompletion(nn.Module):
 
         coarse_points = coarse.transpose(2, 1).contiguous()
 
-        # Phase 3: 逆旋转回原始空间
-        R_inv = R_align.transpose(1, 2).contiguous()  # 正交矩阵的逆 = 转置
+        R_inv = R_align.transpose(1, 2).contiguous()
         coarse_orig = torch.bmm(coarse_points, R_inv)
         fine1_orig = torch.bmm(fine1, R_inv)
         fine2_orig = torch.bmm(fine2, R_inv)
 
         rets = [coarse_orig.contiguous(), fine1_orig.contiguous(), fine2_orig.contiguous()]
-
-        # ✅ 保存 v1, v2 到 self，供 get_loss 使用
-        self.v1 = v1
-        self.v2 = v2
 
         return rets
