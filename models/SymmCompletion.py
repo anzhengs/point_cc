@@ -1,6 +1,7 @@
 # models/SymmCompletion.py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from extensions.chamfer_dist import ChamferDistanceL1
 from .model_utils import MLP_CONV, Transformer, PointNet_SA_Module_KNN
 from .build import MODELS
@@ -8,66 +9,64 @@ from .build import MODELS
 # ======================================
 # 导入 LEFC 前端所需的 VN 算子
 # ======================================
-from .vn_utils import VN_PointNet_SA_Module_KNN
+from .vn_utils import VN_PointNet_SA_Module_KNN, VNLinear, VNMaxPool
 
 # ==============================================================================
-# LEFC: 等变特征协方差规范化前端 (严格排除数学陷阱版)
+# LEFC：等变特征协方差规范化前端(完美解决轴突变 Axis Swapping)
 # ==============================================================================
+
 class VNFrameEstimator(nn.Module):
     def __init__(self):
         super().__init__()
-        # 轻量级 VN 编码器，用于提取等变特征
+        # 使用更深的编码器 + 合理的参数
         self.vn_encoder = VN_PointNet_SA_Module_KNN(
-            npoint=128, nsample=16, in_channel=1, 
-            mlp=[64, 128], group_all=True, if_bn=True, if_idx=False
+            npoint=256, nsample=32, in_channel=1,
+            mlp=[64, 128, 256], group_all=False, if_bn=True, if_idx=False
         )
+        # 全局等变池化
+        self.vn_global_pool = VNMaxPool(dim=-2)
+        
+        # 从全局特征预测基底向量
+        self.vn_predict = VNLinear(256, 2)
 
     def forward(self, x):
         """
-        x: (B, 3, N) 输入的残缺点云
-        返回: R_align (B, 3, 3) 严格的 SO(3) 规范化旋转矩阵
+        x: (B, 3, N) 输入残缺点云
+        返回: R_align (B, 3, 3), v1 (B, 3), v2 (B, 3)
         """
         b, _, n = x.shape
-        x_points = x.transpose(1, 2).unsqueeze(1).contiguous() # (B, 1, N, 3)
-        
-        # 1. 提取等变特征 (B, 128, 128, 3)
+        x_points = x.transpose(1, 2).unsqueeze(1).contiguous()
+
+        # 逐点等变特征: (B, 256, npoint, 3)
         _, v_feat = self.vn_encoder(x, x_points)
+
+        # 全局池化: (B, 256, npoint, 3) → (B, 256, 3)
+        v_feat = self.vn_global_pool(v_feat).squeeze(-2)  # (B, 256, 3)
+
+        # 为 VNLinear 增加 dummy 维度: (B, 256, 1, 3)
+        v_feat = v_feat.unsqueeze(2)
+        basis = self.vn_predict(v_feat).squeeze(2)  # (B, 2, 3)
+
+        v1 = basis[:, 0, :]  # (B, 3)
+        v2 = basis[:, 1, :]  # (B, 3)
+
+        # Gram-Schmidt 正交化
+        u1 = F.normalize(v1, p=2, dim=-1, eps=1e-8)
+        u2_raw = v2 - (v2 * u1).sum(dim=-1, keepdim=True) * u1
+        # 防止退化：当 u2_raw 范数过小时使用 fallback
+        u2_norm = torch.norm(u2_raw, p=2, dim=-1, keepdim=True).clamp(min=1e-6)
+        u2 = u2_raw / u2_norm
+        u3 = torch.cross(u1, u2, dim=-1)
+
+        R_align = torch.stack([u1, u2, u3], dim=-1)  # (B, 3, 3)
         
-        if v_feat.dim() == 4:
-            v_feat = v_feat.mean(dim=2) # 降维后变成 (B, 128, 3)
+        # 确保是正旋转矩阵 (det = +1)
+        det = torch.det(R_align)  # (B,)
+        # 如果 det < 0，翻转第三列
+        sign = torch.sign(det).unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
+        R_align = R_align * sign  # 翻转 u3 使 det=+1
         
-        # 2. 计算协方差矩阵 M = V^T * V -> (B, 3, 3)
-        v_feat = torch.nn.functional.normalize(v_feat, p=2, dim=-1) # 将等变向量长度归一化
-        M = torch.bmm(v_feat.transpose(1, 2), v_feat)
-        
-        # 3. 极其关键：加入微小扰动防止特征值重合导致的 NaN 梯度
-        noise = torch.diag(torch.tensor([1e-5, 2e-5, 3e-5], device=M.device)).unsqueeze(0)
-        M = M + noise
-        
-        # 4. 特征值分解
-        eigenvalues, eigenvectors = torch.linalg.eigh(M)
-        
-        # 提取主轴 (B, 3)
-        v1 = eigenvectors[:, :, 0] 
-        v2 = eigenvectors[:, :, 1]
-        
-        # 5. 解决特征向量的符号多义性
-        sign_v1 = torch.sign((v_feat * v1.unsqueeze(1)).sum(dim=1).sum(dim=-1, keepdim=True))
-        sign_v2 = torch.sign((v_feat * v2.unsqueeze(1)).sum(dim=1).sum(dim=-1, keepdim=True))
-        
-        sign_v1 = sign_v1 + (sign_v1 == 0).float()
-        sign_v2 = sign_v2 + (sign_v2 == 0).float()
-        
-        v1 = v1 * sign_v1
-        v2 = v2 * sign_v2
-        
-        # 6. 叉乘保证生成符合右手定则的第三个轴，强制 det(R) = +1
-        v3 = torch.cross(v1, v2, dim=-1)
-        
-        # 7. 组合成纯旋转矩阵 (B, 3, 3)
-        R_align = torch.stack([v1, v2, v3], dim=-1)
-        
-        return R_align
+        return R_align, v1, v2
 
 # ==============================================================================
 # 原汁原味的 Baseline 类定义 (100% 保持原版不变，保证最高生成精度)
@@ -257,7 +256,6 @@ class SymmCompletion(nn.Module):
         super().__init__()
         self.up_factors = [int(i) for i in config.up_factors.split(',')]
         
-        # [新增] 引入 LEFC 前端
         self.vn_frame_estimator = VNFrameEstimator()
         
         self.lstnet = LSTNet(out_dim=512)
@@ -267,56 +265,73 @@ class SymmCompletion(nn.Module):
         self.include_input = config.include_input
         self.loss_func = ChamferDistanceL1()
         
+        # 正交损失权重
+        self.ortho_weight = getattr(config, 'ortho_weight', 0.1)
+        # 范数正则化权重
+        self.norm_weight = getattr(config, 'norm_weight', 0.01)
+
     def get_loss(self, rets, gt):
+        """
+        rets: list of predicted point clouds
+        gt: ground truth point cloud
+        v1, v2: stored in self during forward
+        """
         loss_list = []
         loss_total = 0
         for pcd in rets:
             loss = self.loss_func(pcd, gt)
             loss_list.append(loss)
             loss_total += loss
-        return loss_total, loss_list[0], loss_list[-1], loss_list[0], loss_list[-1]
+
+        # 正交惩罚：鼓励 v1 ⊥ v2（作为软约束辅助Gram-Schmidt）
+        v1 = self.v1  # (B, 3)
+        v2 = self.v2  # (B, 3)
+        v1_norm = F.normalize(v1, p=2, dim=-1)
+        v2_norm = F.normalize(v2, p=2, dim=-1)
+        loss_ortho = torch.mean((torch.sum(v1_norm * v2_norm, dim=-1)) ** 2)
+        
+        # 范数正则化：防止 v1, v2 退化为零向量
+        loss_norm = torch.mean(1.0 / (torch.norm(v1, p=2, dim=-1) + 1e-6) + 
+                                1.0 / (torch.norm(v2, p=2, dim=-1) + 1e-6))
+
+        # ✅ 修正：将正交损失和范数正则加入总损失
+        total_loss = loss_total + self.ortho_weight * loss_ortho + self.norm_weight * loss_norm
+
+        return total_loss, loss_list[0], loss_list[-1], loss_ortho, loss_norm
 
     def forward(self, point_cloud):
         """
-        Args:
-            point_cloud: (B, N, 3) 带有任意残缺和旋转的输入点云
+        point_cloud: (B, N, 3)
         """
-        # ==========================================
-        # Phase 1: 规范化对齐 (Canonicalization)
-        # ==========================================
-        # 1. 提取等变规范坐标系 R_align
-        pc_t = point_cloud.transpose(1, 2).contiguous() # 转为 (B, 3, N)
-        R_align = self.vn_frame_estimator(pc_t) # 得到 (B, 3, 3) 旋转矩阵
-        
-        # 2. 将输入点云“摆正”至绝对规范空间
-        pc_canonical = torch.bmm(point_cloud, R_align) # (B, N, 3)
+        # Phase 1: 规范化对齐
+        pc_t = point_cloud.transpose(1, 2).contiguous()  # (B, 3, N)
+        R_align, v1, v2 = self.vn_frame_estimator(pc_t)  # (B, 3, 3)
 
-        # ==========================================
-        # Phase 2: 高精度处理 (Processing in Canonical Space)
-        # ==========================================
-        # 所有的 Baseline 操作都在被摆正的数据上执行，无惧外界旋转干扰
-        coarse, symmetry_points, keyfeatures = self.lstnet(pc_canonical.transpose(2,1).contiguous())
-        feat_symmetry = self.local_encoder(symmetry_points) # B,128,512
-        feat_partial = keyfeatures # B,128,512
+        # 将输入点云旋转到规范空间
+        pc_canonical = torch.bmm(point_cloud, R_align)  # (B, N, 3) × (B, 3, 3)
+
+        # Phase 2: 在规范空间中处理
+        coarse, symmetry_points, keyfeatures = self.lstnet(pc_canonical.transpose(2, 1).contiguous())
+        feat_symmetry = self.local_encoder(symmetry_points)
+        feat_partial = keyfeatures
         fine1 = self.sgformer_1(coarse, feat_symmetry, feat_partial)
-        fine2 = self.sgformer_2(fine1.transpose(2,1).contiguous(), feat_symmetry, feat_partial)
+        fine2 = self.sgformer_2(fine1.transpose(2, 1).contiguous(), feat_symmetry, feat_partial)
 
-        if self.include_input: 
+        if self.include_input:
             fine2 = torch.cat([fine2, pc_canonical], dim=1).contiguous()
 
-        coarse_points = coarse.transpose(2, 1).contiguous() # 提取为 (B, 1024, 3) 格式
+        coarse_points = coarse.transpose(2, 1).contiguous()
 
-        # ==========================================
-        # Phase 3: 逆向复原 (De-canonicalization)
-        # ==========================================
-        # 3. 将补全后的点云旋转回真实的观测视角 (R_align 是正交阵，转置即为逆矩阵)
-        R_inv = R_align.transpose(1, 2).contiguous()
-        
+        # Phase 3: 逆旋转回原始空间
+        R_inv = R_align.transpose(1, 2).contiguous()  # 正交矩阵的逆 = 转置
         coarse_orig = torch.bmm(coarse_points, R_inv)
         fine1_orig = torch.bmm(fine1, R_inv)
         fine2_orig = torch.bmm(fine2, R_inv)
 
         rets = [coarse_orig.contiguous(), fine1_orig.contiguous(), fine2_orig.contiguous()]
-        self.pred_dense_point = rets[-1]
+
+        # ✅ 保存 v1, v2 到 self，供 get_loss 使用
+        self.v1 = v1
+        self.v2 = v2
 
         return rets

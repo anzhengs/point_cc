@@ -106,7 +106,10 @@ def run_net(args, config, train_writer=None, val_writer=None):
            
             ret = base_model(partial)
             
-            loss, sparse_loss, dense_loss, sparse_penalty, dense_penalty = base_model.module.get_loss(ret, gt)
+            sparse_penalty = torch.tensor(0.0, device=partial.device)
+            dense_penalty = torch.tensor(0.0, device=partial.device)
+            
+            loss, sparse_loss, dense_loss, ortho_penalty, norm_penalty = base_model.module.get_loss(ret, gt)
             loss.backward()
 
             # Forward

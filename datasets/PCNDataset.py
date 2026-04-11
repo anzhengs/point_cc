@@ -58,7 +58,7 @@ class PCN(data.Dataset):
                 }
             ]
             
-            # ������ 核心修复：只有在不进行随机旋转时，才保留镜像翻转
+            # 核心修复：只有在不进行随机旋转时，才保留镜像翻转
             if not self.random_rotation:
                 transforms_list.append({
                     'callback': 'RandomMirrorPoints',
