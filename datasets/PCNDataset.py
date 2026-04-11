@@ -58,7 +58,7 @@ class PCN(data.Dataset):
                 }
             ]
             
-            # 核心修复：只有在不进行随机旋转时，才保留镜像翻转
+            # 只在未使用随机旋转时才做镜像
             if not self.random_rotation:
                 transforms_list.append({
                     'callback': 'RandomMirrorPoints',
@@ -124,11 +124,15 @@ class PCN(data.Dataset):
         assert data['gt'].shape[0] == self.npoints
 
         # 应用随机旋转
+        # PCNdataset.py 中 _get_transforms：
+        # train时的transforms包含RandomMirrorPoints
+        # 而旋转在transforms之前应用
+
         if self.random_rotation:
-            data['partial'], data['gt'] = apply_random_rotation(data['partial'], data['gt'])
+            data['partial'], data['gt'] = apply_random_rotation(data['partial'], data['gt'])  # SO(3)
 
         if self.transforms is not None:
-            data = self.transforms(data)
+            data = self.transforms(data)  # 包含镜像！
 
         return sample['taxonomy_id'], sample['model_id'], (data['partial'], data['gt'])
 

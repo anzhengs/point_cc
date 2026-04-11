@@ -18,54 +18,50 @@ from .vn_utils import VN_PointNet_SA_Module_KNN, VNLinear, VNMaxPool
 class VNFrameEstimator(nn.Module):
     def __init__(self):
         super().__init__()
-        # 使用更深的编码器 + 合理的参数
-        self.vn_encoder = VN_PointNet_SA_Module_KNN(
-            npoint=256, nsample=32, in_channel=1,
-            mlp=[64, 128, 256], group_all=False, if_bn=True, if_idx=False
+        # 两层SA + 更宽的通道
+        self.vn_sa1 = VN_PointNet_SA_Module_KNN(
+            npoint=512, nsample=32, in_channel=1,
+            mlp=[64, 128], group_all=False, if_bn=True, if_idx=False
         )
-        # 全局等变池化
+        self.vn_sa2 = VN_PointNet_SA_Module_KNN(
+            npoint=256, nsample=32, in_channel=128,
+            mlp=[128, 256], group_all=False, if_bn=True, if_idx=False
+        )
         self.vn_global_pool = VNMaxPool(dim=-2)
-        
-        # 从全局特征预测基底向量
         self.vn_predict = VNLinear(256, 2)
 
     def forward(self, x):
-        """
-        x: (B, 3, N) 输入残缺点云
-        返回: R_align (B, 3, 3), v1 (B, 3), v2 (B, 3)
-        """
         b, _, n = x.shape
         x_points = x.transpose(1, 2).unsqueeze(1).contiguous()
 
-        # 逐点等变特征: (B, 256, npoint, 3)
-        _, v_feat = self.vn_encoder(x, x_points)
+        # 两级编码
+        xyz1, feat1 = self.vn_sa1(x, x_points)
+        xyz1_t = xyz1.transpose(1, 2).unsqueeze(1).contiguous()
+        _, v_feat = self.vn_sa2(xyz1, xyz1_t)  # 需要修改VN SA以接受特征
 
-        # 全局池化: (B, 256, npoint, 3) → (B, 256, 3)
         v_feat = self.vn_global_pool(v_feat).squeeze(-2)  # (B, 256, 3)
-
-        # 为 VNLinear 增加 dummy 维度: (B, 256, 1, 3)
-        v_feat = v_feat.unsqueeze(2)
+        v_feat = v_feat.unsqueeze(2)  # (B, 256, 1, 3)
         basis = self.vn_predict(v_feat).squeeze(2)  # (B, 2, 3)
 
-        v1 = basis[:, 0, :]  # (B, 3)
-        v2 = basis[:, 1, :]  # (B, 3)
+        v1 = basis[:, 0, :]
+        v2 = basis[:, 1, :]
 
-        # Gram-Schmidt 正交化
+        # Gram-Schmidt + det修正
         u1 = F.normalize(v1, p=2, dim=-1, eps=1e-8)
         u2_raw = v2 - (v2 * u1).sum(dim=-1, keepdim=True) * u1
-        # 防止退化：当 u2_raw 范数过小时使用 fallback
         u2_norm = torch.norm(u2_raw, p=2, dim=-1, keepdim=True).clamp(min=1e-6)
         u2 = u2_raw / u2_norm
         u3 = torch.cross(u1, u2, dim=-1)
 
         R_align = torch.stack([u1, u2, u3], dim=-1)  # (B, 3, 3)
-        
-        # 确保是正旋转矩阵 (det = +1)
-        det = torch.det(R_align)  # (B,)
-        # 如果 det < 0，翻转第三列
-        sign = torch.sign(det).unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
-        R_align = R_align * sign  # 翻转 u3 使 det=+1
-        
+        det = torch.det(R_align)
+        sign = torch.sign(det).unsqueeze(-1).unsqueeze(-1)
+        r_col1 = R_align[:, :, 0:1]  # 保留前两列
+        r_col2 = R_align[:, :, 1:2]
+        r_col3 = R_align[:, :, 2:3] * sign  # 第三列乘符号（非原地）
+        R_align = torch.cat([r_col1, r_col2, r_col3], dim=-1)  # 重新拼接
+        # 只翻转第三列
+
         return R_align, v1, v2
 
 # ==============================================================================
@@ -291,10 +287,14 @@ class SymmCompletion(nn.Module):
         loss_ortho = torch.mean((torch.sum(v1_norm * v2_norm, dim=-1)) ** 2)
         
         # 范数正则化：防止 v1, v2 退化为零向量
-        loss_norm = torch.mean(1.0 / (torch.norm(v1, p=2, dim=-1) + 1e-6) + 
-                                1.0 / (torch.norm(v2, p=2, dim=-1) + 1e-6))
+        # 指数形式，自然有界
+        loss_norm = torch.mean(
+            torch.exp(-torch.norm(v1, p=2, dim=-1)) + 
+            torch.exp(-torch.norm(v2, p=2, dim=-1))
+        )
 
-        # ✅ 修正：将正交损失和范数正则加入总损失
+
+        #  修正：将正交损失和范数正则加入总损失
         total_loss = loss_total + self.ortho_weight * loss_ortho + self.norm_weight * loss_norm
 
         return total_loss, loss_list[0], loss_list[-1], loss_ortho, loss_norm
