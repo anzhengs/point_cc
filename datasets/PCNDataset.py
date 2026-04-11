@@ -6,11 +6,25 @@ sys.path.append(BASE_DIR)
 import data_transforms
 from .io import IO
 import random
-import os
 import json
 from .build import DATASETS
 from utils.logger import *
+from scipy.spatial.transform import Rotation as SciPyRot
 
+def apply_random_rotation(partial_pc, gt_pc):
+    """
+    partial_pc: 输入的残缺点云, numpy array (N, 3)
+    gt_pc: 真实的完整点云, numpy array (M, 3)
+    """
+    # 随机生成一个 3x3 的 SO(3) 旋转矩阵
+    rot_matrix = SciPyRot.random().as_matrix().astype(np.float32)
+    
+    # 将相同的旋转矩阵应用到输入和 Ground Truth 上
+    rotated_partial = np.dot(partial_pc, rot_matrix.T)
+    rotated_gt = np.dot(gt_pc, rot_matrix.T)
+    
+    # 强制内存连续，防止后端 torch.bmm 报错
+    return np.ascontiguousarray(rotated_partial), np.ascontiguousarray(rotated_gt)
 
 @DATASETS.register_module()
 class PCN(data.Dataset):
@@ -21,6 +35,7 @@ class PCN(data.Dataset):
         self.npoints = config.N_POINTS
         self.subset = config.subset
         self.cars = config.CARS
+        self.random_rotation = getattr(config, 'RANDOM_ROTATION', False)
 
         # Load the dataset indexing file
         self.dataset_categories = []
@@ -35,19 +50,27 @@ class PCN(data.Dataset):
 
     def _get_transforms(self, subset):
         if subset == 'train':
-            return data_transforms.Compose([{
-                'callback': 'RandomSamplePoints',
-                'parameters': {
-                    'n_points': 2048
-                },
-                'objects': ['partial']
-            }, {
-                'callback': 'RandomMirrorPoints',
-                'objects': ['partial', 'gt']
-            },{
+            transforms_list = [
+                {
+                    'callback': 'RandomSamplePoints',
+                    'parameters': {'n_points': 2048},
+                    'objects': ['partial']
+                }
+            ]
+            
+            # ������ 核心修复：只有在不进行随机旋转时，才保留镜像翻转
+            if not self.random_rotation:
+                transforms_list.append({
+                    'callback': 'RandomMirrorPoints',
+                    'objects': ['partial', 'gt']
+                })
+                
+            transforms_list.append({
                 'callback': 'ToTensor',
                 'objects': ['partial', 'gt']
-            }])
+            })
+            
+            return data_transforms.Compose(transforms_list)
         else:
             return data_transforms.Compose([{
                 'callback': 'RandomSamplePoints',
@@ -92,15 +115,17 @@ class PCN(data.Dataset):
 
         for ri in ['partial', 'gt']:
             file_path = sample['%s_path' % ri]
-            # --- 修改核心开始 ---
             if isinstance(file_path, list):
                 # 确保索引不越界，如果列表只有一个元素（如验证集），则取第0个
                 real_idx = rand_idx if len(file_path) > rand_idx else 0
                 file_path = file_path[real_idx]
-            # --- 修改核心结束 ---
             data[ri] = IO.get(file_path).astype(np.float32)
 
         assert data['gt'].shape[0] == self.npoints
+
+        # 应用随机旋转
+        if self.random_rotation:
+            data['partial'], data['gt'] = apply_random_rotation(data['partial'], data['gt'])
 
         if self.transforms is not None:
             data = self.transforms(data)
