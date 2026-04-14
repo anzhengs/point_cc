@@ -12,6 +12,7 @@ from utils.AverageMeter import AverageMeter
 from utils.metrics import Metrics
 from extensions.chamfer_dist import ChamferDistanceL1, ChamferDistanceL2
 from models.model_utils import fps_subsample
+from scipy.spatial.transform import Rotation as SciPyRot
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def run_net(args, config, train_writer=None, val_writer=None):
@@ -60,13 +61,26 @@ def run_net(args, config, train_writer=None, val_writer=None):
 
     if args.resume:
         builder.resume_optimizer(optimizer, args, logger = logger)
-
+        
+    # ============================================
+    # 课程学习：读取 YAML 中的旋转配置
+    # ============================================
+    rotation_start_epoch = getattr(config.dataset.train.others, 'ROTATION_START_EPOCH', 0)
+    rotation_enabled = getattr(config.dataset.train.others, 'RANDOM_ROTATION', False)
+    
     # Training
     base_model.zero_grad()
     for epoch in range(start_epoch, config.max_epoch + 1):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         base_model.train()
+
+        # ===== 唯一需要新增的一行 =====
+        if hasattr(base_model, 'module') and hasattr(base_model.module, 'set_epoch'):
+            base_model.module.set_epoch(epoch)
+        elif hasattr(base_model, 'set_epoch'):
+            base_model.set_epoch(epoch)
+        # =============================
 
         epoch_start_time = time.time()
         batch_start_time = time.time()
@@ -101,7 +115,24 @@ def run_net(args, config, train_writer=None, val_writer=None):
                 
             else:
                 raise NotImplementedError(f'Train phase do not support {dataset_name}')
-
+                
+        # ============================================
+        # 课程学习：SO(3) 旋转增强 (GPU 侧实时执行)
+        # ============================================
+            if rotation_enabled and (epoch >= rotation_start_epoch):
+                B = partial.shape[0]
+                # 为 batch 中每个样本独立生成随机旋转矩阵
+                rot_matrices = np.stack([
+                    SciPyRot.random().as_matrix().astype(np.float32) 
+                    for _ in range(B)
+                ])  # (B, 3, 3)
+                rot_t = torch.from_numpy(rot_matrices).cuda()  # (B, 3, 3)
+                
+                # 右乘转置：p' = p @ R^T
+                partial = torch.bmm(partial, rot_t.transpose(1, 2))
+                gt = torch.bmm(gt, rot_t.transpose(1, 2))
+        # ============================================
+            
             num_iter += 1
            
             ret = base_model(partial)

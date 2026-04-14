@@ -22,21 +22,24 @@ dataset:
     others:
       subset: 'train'
       RANDOM_ROTATION: True
+      ROTATION_START_EPOCH: 200
   val:
     _base_: ./cfgs/dataset_configs/PCN.yaml
     others:
       subset: 'test'
-      RANDOM_ROTATION: True
+      RANDOM_ROTATION: False
   test:
     _base_: ./cfgs/dataset_configs/PCN.yaml
     others:
       subset: 'test'
-      RANDOM_ROTATION: True
+      RANDOM_ROTATION: False 
 
 model:
   NAME: SymmCompletion
   up_factors: "2, 8"
   include_input: False
   coarse_up_factor: 2
+  lgp_start_epoch: 50
+  lgp_warmup_epochs: 50
 
 consider_metric: CDL1

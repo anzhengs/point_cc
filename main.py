@@ -78,7 +78,9 @@ def get_args():
 
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
-
+    else:
+        args.local_rank = int(os.environ['LOCAL_RANK'])
+        
     if args.test:
         args.exp_name = 'test_' + args.exp_name
     if args.mode is not None:
